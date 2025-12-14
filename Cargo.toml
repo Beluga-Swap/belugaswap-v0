@@ -1,0 +1,19 @@
+[package]
+name = "belugaswap"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"] # Wajib untuk compile ke WASM
+
+[dependencies]
+soroban-sdk = "21.0.0"  # Core SDK Soroban
+
+[dev-dependencies]
+soroban-sdk = { version = "21.0.0", features = ["testutils"] } # Utk unit testing
+
+[profile.release]
+opt-level = "z"         # Optimize for size (hemat storage cost)
+lto = true              # Link Time Optimization
+codegen-units = 1       # Reduce parallelism for better optimization
+panic = "abort"         # Hilangkan stack unwind untuk hemat size
