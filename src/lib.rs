@@ -1,40 +1,31 @@
 #![no_std]
+
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Env, Address, Symbol, symbol_short,
+    contract, contractimpl, contracttype, token, Address, Env, Symbol,
 };
 
-// ============================================================
-// MODULE DECLARATIONS
-// ============================================================
-mod pool;
-mod tick;
 mod math;
-mod swap;
+mod pool;
 mod position;
+mod swap;
+mod tick;
 mod twap;
 
-// ============================================================
-// INTERNAL IMPORTS
-// ============================================================
-use crate::tick::{
-    TickInfo, read_tick_info, write_tick_info, initialize_tick_if_needed,
-    get_fee_growth_inside,
-};
-use crate::math::{
-    ONE_X64, get_liquidity_for_amounts, get_amounts_for_liquidity,
+use math::{
+    get_amounts_for_liquidity, get_liquidity_for_amounts,
     snap_tick_to_spacing, MIN_LIQUIDITY,
 };
-use crate::swap::{engine_swap, validate_and_preview_swap, MIN_SWAP_AMOUNT};
-use crate::pool::{
-    PoolState, PoolConfig, init_pool, read_pool_state, write_pool_state,
-    read_pool_config, write_pool_config,
+use pool::{init_pool, read_pool_config, read_pool_state, write_pool_config, write_pool_state, PoolConfig, PoolState};
+use position::{read_position, write_position, update_position, modify_position, calculate_pending_fees, Position};
+use swap::{engine_swap, validate_and_preview_swap};
+use tick::{
+    get_fee_growth_inside, update_tick, read_tick_info, write_tick_info,
 };
-use crate::position::{Position, read_position, write_position};
 
 // ============================================================
 // DATA KEYS
 // ============================================================
-#[derive(Clone)]
+
 #[contracttype]
 pub enum DataKey {
     PoolState,
@@ -42,25 +33,15 @@ pub enum DataKey {
     Initialized,
     Tick(i32),
     Position(Address, i32, i32),
-    TickCross(i32), 
-    TWAPObservation(u32),  
-    TWAPNewestIndex,       
+    // TWAP keys
+    TWAPObservation(u32),
+    TWAPNewestIndex,
     TWAPInitialized,
-    TickPositions(i32), 
 }
 
 // ============================================================
 // RETURN TYPES
 // ============================================================
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct SwapResult {
-    pub amount_in: i128,
-    pub amount_out: i128,
-    pub current_tick: i32,
-    pub sqrt_price_x64: u128,
-}
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -74,24 +55,16 @@ pub struct PositionInfo {
 
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct QuoteResult {
+pub struct SwapResult {
     pub amount_in: i128,
     pub amount_out: i128,
-    pub final_sqrt_price: u128,
-    pub final_tick: i32,
-    pub fee_paid: i128,
+    pub current_tick: i32,
+    pub sqrt_price_x64: u128,
 }
 
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct TickCrossData {
-    pub fee_growth_global_0: u128,
-    pub fee_growth_global_1: u128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct SwapPreview {
+pub struct PreviewResult {
     pub amount_in_used: i128,
     pub amount_out_expected: i128,
     pub fee_paid: i128,
@@ -101,173 +74,14 @@ pub struct SwapPreview {
 }
 
 // ============================================================
-// TICK POSITIONS TRACKING
-// ============================================================
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct PositionKey {
-    pub owner: Address,
-    pub lower: i32,
-    pub upper: i32,
-}
-
-/// Register position at tick boundary
-fn register_position_at_tick(
-    env: &Env,
-    tick: i32,
-    owner: Address,
-    lower: i32,
-    upper: i32,
-) {
-    use soroban_sdk::Vec;
-    
-    let key = PositionKey {
-        owner: owner.clone(),
-        lower,
-        upper,
-    };
-    
-    let mut positions: Vec<PositionKey> = env
-        .storage()
-        .persistent()
-        .get(&DataKey::TickPositions(tick))
-        .unwrap_or(Vec::new(env));
-    
-    // Check if already exists
-    let mut exists = false;
-    for p in positions.iter() {
-        if p.owner == owner && p.lower == lower && p.upper == upper {
-            exists = true;
-            break;
-        }
-    }
-    
-    if !exists {
-        positions.push_back(key);
-        env.storage()
-            .persistent()
-            .set(&DataKey::TickPositions(tick), &positions);
-    }
-}
-
-/// Unregister position from tick boundary
-fn unregister_position_at_tick(
-    env: &Env,
-    tick: i32,
-    owner: &Address,
-    lower: i32,
-    upper: i32,
-) {
-    use soroban_sdk::Vec;
-    
-    let positions_opt: Option<Vec<PositionKey>> = env
-        .storage()
-        .persistent()
-        .get(&DataKey::TickPositions(tick));
-    
-    if positions_opt.is_none() {
-        return;
-    }
-    
-    let old_positions = positions_opt.unwrap();
-    let mut new_positions = Vec::new(env);
-    
-    // Filter out the matching position
-    for p in old_positions.iter() {
-        if !(p.owner == *owner && p.lower == lower && p.upper == upper) {
-            new_positions.push_back(p);
-        }
-    }
-    
-    if new_positions.is_empty() {
-        env.storage()
-            .persistent()
-            .remove(&DataKey::TickPositions(tick));
-    } else {
-        env.storage()
-            .persistent()
-            .set(&DataKey::TickPositions(tick), &new_positions);
-    }
-}
-
-/// Get positions at tick
-fn get_positions_at_tick(env: &Env, tick: i32) -> soroban_sdk::Vec<PositionKey> {
-    use soroban_sdk::Vec;
-    
-    env.storage()
-        .persistent()
-        .get(&DataKey::TickPositions(tick))
-        .unwrap_or(Vec::new(env))
-}
-// ============================================================
-// FEE UPDATE HELPER
-// ============================================================
-
-/// Update position fees before modifying liquidity
-fn update_position_fees(
-    env: &Env,
-    pos: &mut Position,
-    lower_tick: i32,
-    upper_tick: i32,
-    fee_growth_inside_0: u128,
-    fee_growth_inside_1: u128,
-) {
-    if pos.liquidity == 0 {
-        pos.fee_growth_inside_last_0 = fee_growth_inside_0;
-        pos.fee_growth_inside_last_1 = fee_growth_inside_1;
-        pos.last_update_timestamp = env.ledger().timestamp();
-        return;
-    }
-
-    let pool = read_pool_state(env);
-    let current_tick = pool.current_tick;
-    let position_inactive = current_tick < lower_tick || current_tick >= upper_tick;
-
-    let liquidity_u = pos.liquidity as u128;
-    let delta_0 = fee_growth_inside_0.wrapping_sub(pos.fee_growth_inside_last_0);
-    let delta_1 = fee_growth_inside_1.wrapping_sub(pos.fee_growth_inside_last_1);
-
-    const MAX_REASONABLE_DELTA: u128 = u128::MAX / 2;
-    
-    let should_use_twap = position_inactive && pos.last_update_timestamp > 0;
-    
-    if !should_use_twap && delta_0 < MAX_REASONABLE_DELTA && delta_1 < MAX_REASONABLE_DELTA {
-        let fee_0 = liquidity_u.wrapping_mul(delta_0) >> 64;
-        let fee_1 = liquidity_u.wrapping_mul(delta_1) >> 64;
-        pos.tokens_owed_0 = pos.tokens_owed_0.saturating_add(fee_0);
-        pos.tokens_owed_1 = pos.tokens_owed_1.saturating_add(fee_1);
-    } else {
-        use crate::twap;
-        
-        let (fee_0, fee_1) = twap::calculate_fees_from_twap(
-            env,
-            pos.liquidity,
-            lower_tick,
-            upper_tick,
-            pos.fee_growth_inside_last_0,
-            pos.fee_growth_inside_last_1,
-            pos.last_update_timestamp,
-        );
-        
-        pos.tokens_owed_0 = pos.tokens_owed_0.saturating_add(fee_0);
-        pos.tokens_owed_1 = pos.tokens_owed_1.saturating_add(fee_1);
-    }
-
-    pos.fee_growth_inside_last_0 = fee_growth_inside_0;
-    pos.fee_growth_inside_last_1 = fee_growth_inside_1;
-    pos.last_update_timestamp = env.ledger().timestamp();
-}
-
-// ============================================================
-// MAIN CONTRACT
+// CONTRACT
 // ============================================================
 
 #[contract]
-pub struct ClmmPool;
+pub struct BelugaSwap;
 
 #[contractimpl]
-impl ClmmPool {
+impl BelugaSwap {
     // ========================================================
     // INITIALIZATION
     // ========================================================
@@ -285,61 +99,40 @@ impl ClmmPool {
     ) {
         admin.require_auth();
 
-        // Validate not already initialized
         if env.storage().persistent().has(&DataKey::Initialized) {
-            panic!("pool already initialized");
+            panic!("already initialized");
         }
 
-        // Validate inputs
-        if token_a == token_b {
-            panic!("tokens must be different");
+        if fee_bps == 0 || fee_bps > 10000 {
+            panic!("invalid fee");
         }
+
+        if protocol_fee_bps > 10000 {
+            panic!("invalid protocol fee");
+        }
+
         if tick_spacing <= 0 {
             panic!("invalid tick spacing");
         }
-        if fee_bps == 0 || fee_bps >= 10000 {
-            panic!("invalid fee bps");
-        }
-        if protocol_fee_bps > 5000 {
-            panic!("protocol fee too high");
-        }
 
-        let initial_sqrt = if sqrt_price_x64 == 0 {
-            ONE_X64
+        // Sort tokens for consistent ordering
+        let (token0, token1) = if token_a < token_b {
+            (token_a.clone(), token_b.clone())
         } else {
-            sqrt_price_x64
+            (token_b.clone(), token_a.clone())
         };
 
-        // Initialize pool
-        init_pool(
-            &env,
-            initial_sqrt,
-            current_tick,
-            tick_spacing,
-            token_a.clone(),
-            token_b.clone(),
-        );
-         use crate::twap;
-    
-        let snapped_tick = snap_tick_to_spacing(current_tick, tick_spacing);
-    
-        twap::initialize_twap(
-        &env,
-        snapped_tick,
-        0,  // fee_growth_global_0 start at 0
-        0,  // fee_growth_global_1 start at 0
-        0,  // liquidity start at 0
-    );
-
-        // Save config
-        let cfg = PoolConfig {
+        let config = PoolConfig {
             admin,
             token_a,
             token_b,
             fee_bps,
             protocol_fee_bps,
         };
-        write_pool_config(&env, &cfg);
+
+        write_pool_config(&env, &config);
+
+        init_pool(&env, sqrt_price_x64, current_tick, tick_spacing, token0, token1);
 
         env.storage().persistent().set(&DataKey::Initialized, &true);
 
@@ -350,20 +143,8 @@ impl ClmmPool {
     }
 
     // ========================================================
-    // VIEW FUNCTIONS
+    // VIEW POSITION - WITH PENDING FEES
     // ========================================================
-
-    pub fn get_pool_state(env: Env) -> PoolState {
-        read_pool_state(&env)
-    }
-
-    pub fn get_pool_config(env: Env) -> PoolConfig {
-        read_pool_config(&env)
-    }
-
-    pub fn get_tick_info(env: Env, tick: i32) -> TickInfo {
-        read_tick_info(&env, tick)
-    }
 
     pub fn get_position(
         env: Env,
@@ -384,7 +165,6 @@ impl ClmmPool {
             };
         }
 
-        // Calculate current amounts
         let sqrt_lower = math::get_sqrt_ratio_at_tick(lower);
         let sqrt_upper = math::get_sqrt_ratio_at_tick(upper);
 
@@ -396,7 +176,7 @@ impl ClmmPool {
             pool.sqrt_price_x64,
         );
 
-        // Calculate uncollected fees
+        // Calculate pending fees
         let (inside_0, inside_1) = get_fee_growth_inside(
             &env,
             lower,
@@ -406,23 +186,7 @@ impl ClmmPool {
             pool.fee_growth_global_1,
         );
 
-        let delta_0 = inside_0.wrapping_sub(pos.fee_growth_inside_last_0);
-        let delta_1 = inside_1.wrapping_sub(pos.fee_growth_inside_last_1);
-
-        // Only calculate fees if delta is reasonable
-        const MAX_REASONABLE_DELTA: u128 = u128::MAX / 2;
-        
-        let pending_0 = if delta_0 < MAX_REASONABLE_DELTA {
-            (pos.liquidity as u128).wrapping_mul(delta_0) >> 64
-        } else {
-            0 // Position was inactive, skip fee calculation
-        };
-        
-        let pending_1 = if delta_1 < MAX_REASONABLE_DELTA {
-            (pos.liquidity as u128).wrapping_mul(delta_1) >> 64
-        } else {
-            0 // Position was inactive, skip fee calculation
-        };
+        let (pending_0, pending_1) = calculate_pending_fees(&pos, inside_0, inside_1);
 
         PositionInfo {
             liquidity: pos.liquidity,
@@ -433,281 +197,304 @@ impl ClmmPool {
         }
     }
 
-    /// Get pending fees for a position (view-only, does not modify state)
-    /// 
-    /// Returns total claimable fees including:
-    /// - Already accrued fees (tokens_owed_0, tokens_owed_1)
-    /// - Newly accumulated fees since last update
-    /// 
-    /// # Arguments
-    /// * `owner` - Position owner address
-    /// * `lower_tick` - Lower tick boundary
-    /// * `upper_tick` - Upper tick boundary
-    /// 
-    /// # Returns
-    /// `(total_fee_0, total_fee_1)` - Total claimable fees for token0 and token1
-    pub fn get_pending_fees(
-        env: Env,
-        owner: Address,
-        lower_tick: i32,
-        upper_tick: i32,
-    ) -> (u128, u128) {
-        let pool = read_pool_state(&env);
-        
-        // Snap ticks to spacing
-        let lower = snap_tick_to_spacing(lower_tick, pool.tick_spacing);
-        let upper = snap_tick_to_spacing(upper_tick, pool.tick_spacing);
-        
-        // Load position
-        let pos = read_position(&env, &owner, lower, upper);
-        
-        // If no liquidity, return only already accrued fees
-        if pos.liquidity == 0 {
-            return (pos.tokens_owed_0, pos.tokens_owed_1);
-        }
-        
-        // Calculate fee growth inside the position's range
-        let (inside_0, inside_1) = get_fee_growth_inside(
-            &env,
-            lower,
-            upper,
-            pool.current_tick,
-            pool.fee_growth_global_0,
-            pool.fee_growth_global_1,
-        );
-        
-        // Calculate delta in fee growth since last update
-        // Use wrapping_sub to handle fee growth overflow (u128 wraps around)
-        let delta_0 = inside_0.wrapping_sub(pos.fee_growth_inside_last_0);
-        let delta_1 = inside_1.wrapping_sub(pos.fee_growth_inside_last_1);
-        
-        // Calculate newly accumulated fees
-        // Formula: fee = (liquidity * delta_fee_growth_Q64) / 2^64
-        // CRITICAL FIX: Use wrapping_mul (same as update_position_fees)
-        let liquidity_u = pos.liquidity as u128;
-        let new_fee_0 = liquidity_u.wrapping_mul(delta_0) >> 64;
-        let new_fee_1 = liquidity_u.wrapping_mul(delta_1) >> 64;
-        
-        // Total fees = already accrued + newly accumulated
-        let total_fee_0 = pos.tokens_owed_0.saturating_add(new_fee_0);
-        let total_fee_1 = pos.tokens_owed_1.saturating_add(new_fee_1);
-        
-        (total_fee_0, total_fee_1)
+    // ========================================================
+    // POOL STATE
+    // ========================================================
+
+    pub fn get_pool_state(env: Env) -> PoolState {
+        read_pool_state(&env)
+    }
+
+    pub fn get_tick_info(env: Env, tick: i32) -> tick::TickInfo {
+        read_tick_info(&env, tick)
     }
 
     // ========================================================
-    // SWAP PREVIEW & QUOTE
+    // SWAP HELPERS
     // ========================================================
 
+    /// Get swap direction for a given input token
+    pub fn get_swap_direction(
+        env: Env,
+        token_in: Address,
+    ) -> bool {
+        let pool = read_pool_state(&env);
+        token_in == pool.token0
+    }
+
+    // ========================================================
+    // SWAP (MAIN - USER FRIENDLY)
+    // ========================================================
+
+    /// Swap tokens with automatic direction detection
+    pub fn swap(
+        env: Env,
+        caller: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        sqrt_price_limit_x64: u128,
+    ) -> SwapResult {
+        let pool = read_pool_state(&env);
+
+        // Validate tokens
+        if token_in != pool.token0 && token_in != pool.token1 {
+            panic!("invalid token_in");
+        }
+        if token_out != pool.token0 && token_out != pool.token1 {
+            panic!("invalid token_out");
+        }
+        if token_in == token_out {
+            panic!("same token");
+        }
+
+        // Auto-detect direction
+        let zero_for_one = token_in == pool.token0;
+
+        // Call advanced swap
+        Self::swap_advanced(
+            env,
+            caller,
+            amount_in,
+            min_amount_out,
+            zero_for_one,
+            sqrt_price_limit_x64,
+        )
+    }
+
+    /// Preview swap with automatic direction detection
     pub fn preview_swap(
         env: Env,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        sqrt_price_limit_x64: u128,
+    ) -> PreviewResult {
+        let pool = read_pool_state(&env);
+
+        // Validate tokens
+        if token_in != pool.token0 && token_in != pool.token1 {
+            return PreviewResult {
+                amount_in_used: 0,
+                amount_out_expected: 0,
+                fee_paid: 0,
+                price_impact_bps: 0,
+                is_valid: false,
+                error_message: Some(Symbol::new(&env, "bad_token")),
+            };
+        }
+        if token_out != pool.token0 && token_out != pool.token1 {
+            return PreviewResult {
+                amount_in_used: 0,
+                amount_out_expected: 0,
+                fee_paid: 0,
+                price_impact_bps: 0,
+                is_valid: false,
+                error_message: Some(Symbol::new(&env, "bad_token")),
+            };
+        }
+        if token_in == token_out {
+            return PreviewResult {
+                amount_in_used: 0,
+                amount_out_expected: 0,
+                fee_paid: 0,
+                price_impact_bps: 0,
+                is_valid: false,
+                error_message: Some(Symbol::new(&env, "same_token")),
+            };
+        }
+
+        // Auto-detect direction
+        let zero_for_one = token_in == pool.token0;
+
+        // Call advanced preview
+        Self::preview_swap_advanced(env, amount_in, min_amount_out, zero_for_one, sqrt_price_limit_x64)
+    }
+
+    // ========================================================
+    // SWAP ADVANCED (FOR POWER USERS)
+    // ========================================================
+
+    /// Swap with manual direction control
+    pub fn swap_advanced(
+        env: Env,
+        caller: Address,
         amount_specified: i128,
         min_amount_out: i128,
         zero_for_one: bool,
         sqrt_price_limit_x64: u128,
-    ) -> SwapPreview {
-        let pool = read_pool_state(&env);
+    ) -> SwapResult {
+        caller.require_auth();
+
         let config = read_pool_config(&env);
+        let mut pool = read_pool_state(&env);
 
-        // Check minimum amount
-        if amount_specified < MIN_SWAP_AMOUNT {
-            return SwapPreview {
-                amount_in_used: 0,
-                amount_out_expected: 0,
-                fee_paid: 0,
-                price_impact_bps: 0,
-                is_valid: false,
-                error_message: Some(symbol_short!("AMT_LOW")),
-            };
-        }
+        let fee_bps = config.fee_bps as i128;
+        let protocol_fee_bps = config.protocol_fee_bps as i128;
 
-        // Check pool liquidity
-        if pool.liquidity <= 0 {
-            return SwapPreview {
-                amount_in_used: 0,
-                amount_out_expected: 0,
-                fee_paid: 0,
-                price_impact_bps: 0,
-                is_valid: false,
-                error_message: Some(symbol_short!("NO_LIQ")),
-            };
-        }
-
-        // Try to validate and get preview
-        let result = validate_and_preview_swap(
+        let validation = validate_and_preview_swap(
             &env,
             &pool,
             amount_specified,
             min_amount_out,
             zero_for_one,
             sqrt_price_limit_x64,
-            config.fee_bps as i128,
+            fee_bps,
         );
 
-        match result {
-            Ok((amount_in_used, amount_out, fee_paid, final_price)) => {
-                // Calculate price impact
-                let price_before = pool.sqrt_price_x64;
-                let price_change = if final_price > price_before {
-                    final_price - price_before
-                } else {
-                    price_before - final_price
-                };
-                
-                let price_impact_u128 = if price_before > 0 {
-                    price_change.saturating_mul(10000).saturating_div(price_before)
+        if let Err(e) = validation {
+            panic!("swap validation failed: {:?}", e);
+        }
+
+        let (amount_in_total, amount_out_total) = engine_swap(
+            &env,
+            &mut pool,
+            amount_specified,
+            zero_for_one,
+            sqrt_price_limit_x64,
+            fee_bps,
+            protocol_fee_bps,
+        );
+
+        write_pool_state(&env, &pool);
+
+        let pool_addr = env.current_contract_address();
+
+        // Transfer tokens
+        if zero_for_one {
+            // Swap token0 -> token1
+            token::Client::new(&env, &pool.token0)
+                .transfer(&caller, &pool_addr, &amount_in_total);
+            token::Client::new(&env, &pool.token1)
+                .transfer(&pool_addr, &caller, &amount_out_total);
+        } else {
+            // Swap token1 -> token0
+            token::Client::new(&env, &pool.token1)
+                .transfer(&caller, &pool_addr, &amount_in_total);
+            token::Client::new(&env, &pool.token0)
+                .transfer(&pool_addr, &caller, &amount_out_total);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "swap"),),
+            (amount_in_total, amount_out_total, zero_for_one),
+        );
+
+        SwapResult {
+            amount_in: amount_in_total,
+            amount_out: amount_out_total,
+            current_tick: pool.current_tick,
+            sqrt_price_x64: pool.sqrt_price_x64,
+        }
+    }
+
+    /// Preview swap with manual direction control
+    pub fn preview_swap_advanced(
+        env: Env,
+        amount_specified: i128,
+        min_amount_out: i128,
+        zero_for_one: bool,
+        sqrt_price_limit_x64: u128,
+    ) -> PreviewResult {
+        let config = read_pool_config(&env);
+        let pool = read_pool_state(&env);
+        let fee_bps = config.fee_bps as i128;
+
+        let validation = validate_and_preview_swap(
+            &env,
+            &pool,
+            amount_specified,
+            min_amount_out,
+            zero_for_one,
+            sqrt_price_limit_x64,
+            fee_bps,
+        );
+
+        match validation {
+            Ok((amount_in_used, amount_out, fee_paid, _final_price)) => {
+                let price_impact = if amount_specified > 0 {
+                    ((amount_specified - amount_out) * 10000) / amount_specified
                 } else {
                     0
                 };
-                
-                let price_impact_bps = if price_impact_u128 > i128::MAX as u128 {
-                    i128::MAX
-                } else {
-                    price_impact_u128 as i128
-                };
 
-                SwapPreview {
+                PreviewResult {
                     amount_in_used,
                     amount_out_expected: amount_out,
                     fee_paid,
-                    price_impact_bps,
+                    price_impact_bps: price_impact,
                     is_valid: true,
                     error_message: None,
                 }
             }
-            Err(err_symbol) => {
-                SwapPreview {
-                    amount_in_used: 0,
-                    amount_out_expected: 0,
-                    fee_paid: 0,
-                    price_impact_bps: 0,
-                    is_valid: false,
-                    error_message: Some(err_symbol),
-                }
-            }
-        }
-    }
-
-    pub fn quote(
-        env: Env,
-        amount_in: i128,
-        zero_for_one: bool,
-        sqrt_price_limit: u128,
-    ) -> QuoteResult {
-        let pool = read_pool_state(&env);
-        let config = read_pool_config(&env);
-
-        let (amount_in_used, amount_out, final_sqrt) = swap::quote_swap(
-            &env,
-            &pool,
-            amount_in,
-            zero_for_one,
-            sqrt_price_limit,
-            config.fee_bps as i128,
-        );
-
-        let fee_paid = amount_in_used.saturating_sub(amount_out);
-        let mut final_tick = pool.current_tick;
-        
-        if final_sqrt < pool.sqrt_price_x64 {
-            final_tick -= pool.tick_spacing;
-        } else if final_sqrt > pool.sqrt_price_x64 {
-            final_tick += pool.tick_spacing;
-        }
-
-        QuoteResult {
-            amount_in: amount_in_used,
-            amount_out,
-            final_sqrt_price: final_sqrt,
-            final_tick,
-            fee_paid,
+            Err(e) => PreviewResult {
+                amount_in_used: 0,
+                amount_out_expected: 0,
+                fee_paid: 0,
+                price_impact_bps: 0,
+                is_valid: false,
+                error_message: Some(e),
+            },
         }
     }
 
     // ========================================================
-    // SWAP
+    // ADD LIQUIDITY (MAIN - USER FRIENDLY)
     // ========================================================
 
-pub fn swap(
-    env: Env,
-    caller: Address,
-    amount_specified: i128,
-    min_amount_out: i128,
-    zero_for_one: bool,
-    sqrt_price_limit_x64: u128,
-) -> SwapResult {
-    caller.require_auth();
-
-    let mut pool = read_pool_state(&env);
-    let config = read_pool_config(&env);
-    let pool_addr = env.current_contract_address();
-
-    if amount_specified < MIN_SWAP_AMOUNT {
-        panic!("swap amount too small");
-    }
-
-    let (amount_in_total, amount_out_total) = engine_swap(
-        &env,
-        &mut pool,
-        amount_specified,
-        zero_for_one,
-        sqrt_price_limit_x64,
-        config.fee_bps as i128,
-        config.protocol_fee_bps as i128,
-    );
-
-    if amount_in_total <= 0 || amount_out_total <= 0 {
-        panic!("swap failed");
-    }
-
-    if amount_out_total < min_amount_out {
-        panic!("insufficient output");
-    }
-
-    write_pool_state(&env, &pool);
-
-    // ============================================================
-    // TWAP UPDATE 
-    // ============================================================
-    use crate::twap;
-    twap::update_twap(
-        &env,
-        pool.current_tick,
-        pool.fee_growth_global_0,
-        pool.fee_growth_global_1,
-        pool.liquidity,
-    );
-    // ============================================================
-
-    let token0 = token::Client::new(&env, &pool.token0);
-    let token1 = token::Client::new(&env, &pool.token1);
-
-    if zero_for_one {
-        token0.transfer(&caller, &pool_addr, &amount_in_total);
-        token1.transfer(&pool_addr, &caller, &amount_out_total);
-    } else {
-        token1.transfer(&caller, &pool_addr, &amount_in_total);
-        token0.transfer(&pool_addr, &caller, &amount_out_total);
-    }
-
-    env.events().publish(
-        (Symbol::new(&env, "swap"),),
-        (amount_in_total, amount_out_total, zero_for_one),
-    );
-
-    SwapResult {
-        amount_in: amount_in_total,
-        amount_out: amount_out_total,
-        current_tick: pool.current_tick,
-        sqrt_price_x64: pool.sqrt_price_x64,
-    }
-}
-
-    // ========================================================
-    // ADD LIQUIDITY
-    // ========================================================
-
+    /// Add liquidity with automatic token ordering
     pub fn add_liquidity(
+        env: Env,
+        owner: Address,
+        token_a: Address,
+        token_b: Address,
+        amount_a_desired: i128,
+        amount_b_desired: i128,
+        amount_a_min: i128,
+        amount_b_min: i128,
+        lower_tick: i32,
+        upper_tick: i32,
+    ) -> (i128, i128, i128) {
+        let pool = read_pool_state(&env);
+
+        // Validate tokens
+        if (token_a != pool.token0 && token_a != pool.token1) || 
+           (token_b != pool.token0 && token_b != pool.token1) {
+            panic!("invalid tokens");
+        }
+        if token_a == token_b {
+            panic!("same token");
+        }
+
+        // Map user's token_a/token_b to pool's token0/token1
+        let (amount0_desired, amount1_desired, amount0_min, amount1_min) = 
+            if token_a == pool.token0 {
+                (amount_a_desired, amount_b_desired, amount_a_min, amount_b_min)
+            } else {
+                (amount_b_desired, amount_a_desired, amount_b_min, amount_a_min)
+            };
+
+        // Call advanced add_liquidity
+        Self::add_liquidity_advanced(
+            env,
+            owner,
+            lower_tick,
+            upper_tick,
+            amount0_desired,
+            amount1_desired,
+            amount0_min,
+            amount1_min,
+        )
+    }
+
+    // ========================================================
+    // ADD LIQUIDITY ADVANCED (UNISWAP V3 STYLE)
+    // ========================================================
+
+    /// Add liquidity with manual token0/token1 amounts
+    pub fn add_liquidity_advanced(
         env: Env,
         owner: Address,
         lower_tick: i32,
@@ -719,10 +506,10 @@ pub fn swap(
     ) -> (i128, i128, i128) {
         owner.require_auth();
 
-        let config = read_pool_config(&env);
         let mut pool = read_pool_state(&env);
         let pool_addr = env.current_contract_address();
 
+        // Snap ticks to spacing
         let lower = snap_tick_to_spacing(lower_tick, pool.tick_spacing);
         let upper = snap_tick_to_spacing(upper_tick, pool.tick_spacing);
 
@@ -733,6 +520,7 @@ pub fn swap(
         let sqrt_lower = math::get_sqrt_ratio_at_tick(lower);
         let sqrt_upper = math::get_sqrt_ratio_at_tick(upper);
 
+        // Calculate liquidity from amounts
         let liquidity = get_liquidity_for_amounts(
             &env,
             amount0_desired,
@@ -746,6 +534,7 @@ pub fn swap(
             panic!("liquidity too low");
         }
 
+        // Calculate actual amounts needed
         let (amount0_actual, amount1_actual) = get_amounts_for_liquidity(
             &env,
             liquidity,
@@ -758,24 +547,29 @@ pub fn swap(
             panic!("slippage exceeded");
         }
 
-        let lower_info_init = initialize_tick_if_needed(
+        // IMPORTANT: Update ticks FIRST to initialize fee_growth_outside properly
+        // This must happen BEFORE calculating fee_growth_inside
+        let _lower_flipped = update_tick(
             &env,
             lower,
             pool.current_tick,
+            liquidity,
             pool.fee_growth_global_0,
             pool.fee_growth_global_1,
+            false, // lower tick
         );
-        write_tick_info(&env, lower, &lower_info_init);
 
-        let upper_info_init = initialize_tick_if_needed(
+        let _upper_flipped = update_tick(
             &env,
             upper,
             pool.current_tick,
+            liquidity,
             pool.fee_growth_global_0,
             pool.fee_growth_global_1,
+            true, // upper tick
         );
-        write_tick_info(&env, upper, &upper_info_init);
 
+        // NOW get fee growth inside AFTER ticks are initialized
         let (inside_0, inside_1) = get_fee_growth_inside(
             &env,
             lower,
@@ -785,37 +579,25 @@ pub fn swap(
             pool.fee_growth_global_1,
         );
 
+        // Update position using Uniswap V3 pattern
         let mut pos = read_position(&env, &owner, lower, upper);
-        update_position_fees(&env, &mut pos, lower, upper, inside_0, inside_1);
-        pos.liquidity = pos.liquidity.saturating_add(liquidity);
+        modify_position(&mut pos, liquidity, inside_0, inside_1);
+        write_position(&env, &owner, lower, upper, &pos);
 
-        let mut lower_info = read_tick_info(&env, lower);
-        let mut upper_info = read_tick_info(&env, upper);
-
-        lower_info.liquidity_gross = lower_info.liquidity_gross.saturating_add(liquidity);
-        lower_info.liquidity_net = lower_info.liquidity_net.saturating_add(liquidity);
-        write_tick_info(&env, lower, &lower_info);
-
-        upper_info.liquidity_gross = upper_info.liquidity_gross.saturating_add(liquidity);
-        upper_info.liquidity_net = upper_info.liquidity_net.saturating_sub(liquidity);
-        write_tick_info(&env, upper, &upper_info);
-
+        // Update pool liquidity if position is in range
         if pool.current_tick >= lower && pool.current_tick < upper {
             pool.liquidity = pool.liquidity.saturating_add(liquidity);
         }
         write_pool_state(&env, &pool);
-        write_position(&env, &owner, lower, upper, &pos);
 
-        register_position_at_tick(&env, lower, owner.clone(), lower, upper);
-        register_position_at_tick(&env, upper, owner.clone(), lower, upper);
-
+        // Transfer tokens
         if amount0_actual > 0 {
-            token::Client::new(&env, &config.token_a)
+            token::Client::new(&env, &pool.token0)
                 .transfer(&owner, &pool_addr, &amount0_actual);
         }
 
         if amount1_actual > 0 {
-            token::Client::new(&env, &config.token_b)
+            token::Client::new(&env, &pool.token1)
                 .transfer(&owner, &pool_addr, &amount1_actual);
         }
 
@@ -836,17 +618,21 @@ pub fn swap(
         owner: Address,
         lower_tick: i32,
         upper_tick: i32,
-        liquidity_to_remove: i128,
+        liquidity_delta: i128,
     ) -> (i128, i128) {
         owner.require_auth();
 
-        let config = read_pool_config(&env);
         let mut pool = read_pool_state(&env);
         let pool_addr = env.current_contract_address();
 
         let lower = snap_tick_to_spacing(lower_tick, pool.tick_spacing);
         let upper = snap_tick_to_spacing(upper_tick, pool.tick_spacing);
 
+        if liquidity_delta <= 0 {
+            panic!("invalid liquidity amount");
+        }
+
+        // Get fee growth inside BEFORE modifying anything
         let (inside_0, inside_1) = get_fee_growth_inside(
             &env,
             lower,
@@ -858,59 +644,68 @@ pub fn swap(
 
         let mut pos = read_position(&env, &owner, lower, upper);
 
-        if pos.liquidity < liquidity_to_remove {
+        if liquidity_delta > pos.liquidity {
             panic!("insufficient liquidity");
         }
 
-        update_position_fees(&env, &mut pos, lower, upper, inside_0, inside_1);
+        // Update position fees and reduce liquidity
+        modify_position(&mut pos, -liquidity_delta, inside_0, inside_1);
+        write_position(&env, &owner, lower, upper, &pos);
 
+        // Update ticks (negative liquidity delta)
+        update_tick(
+            &env,
+            lower,
+            pool.current_tick,
+            -liquidity_delta,
+            pool.fee_growth_global_0,
+            pool.fee_growth_global_1,
+            false, // lower tick
+        );
+
+        update_tick(
+            &env,
+            upper,
+            pool.current_tick,
+            -liquidity_delta,
+            pool.fee_growth_global_0,
+            pool.fee_growth_global_1,
+            true, // upper tick
+        );
+
+        // Update pool liquidity if position was in range
+        if pool.current_tick >= lower && pool.current_tick < upper {
+            pool.liquidity = pool.liquidity.saturating_sub(liquidity_delta);
+        }
+
+        write_pool_state(&env, &pool);
+
+        // Calculate amounts to return
         let sqrt_lower = math::get_sqrt_ratio_at_tick(lower);
         let sqrt_upper = math::get_sqrt_ratio_at_tick(upper);
 
         let (amount0, amount1) = get_amounts_for_liquidity(
             &env,
-            liquidity_to_remove,
+            liquidity_delta,
             sqrt_lower,
             sqrt_upper,
             pool.sqrt_price_x64,
         );
 
-        pos.liquidity = pos.liquidity.saturating_sub(liquidity_to_remove);
-        write_position(&env, &owner, lower, upper, &pos);
-
-        if pos.liquidity == 0 {
-        unregister_position_at_tick(&env, lower, &owner, lower, upper);
-        unregister_position_at_tick(&env, upper, &owner, lower, upper);
-        }
-
-        let mut lower_info = read_tick_info(&env, lower);
-        lower_info.liquidity_gross = lower_info.liquidity_gross.saturating_sub(liquidity_to_remove);
-        lower_info.liquidity_net = lower_info.liquidity_net.saturating_sub(liquidity_to_remove);
-        write_tick_info(&env, lower, &lower_info);
-
-        let mut upper_info = read_tick_info(&env, upper);
-        upper_info.liquidity_gross = upper_info.liquidity_gross.saturating_sub(liquidity_to_remove);
-        upper_info.liquidity_net = upper_info.liquidity_net.saturating_add(liquidity_to_remove);
-        write_tick_info(&env, upper, &upper_info);
-
-        if pool.current_tick >= lower && pool.current_tick < upper {
-            pool.liquidity = pool.liquidity.saturating_sub(liquidity_to_remove);
-        }
-        write_pool_state(&env, &pool);
-
+        // Transfer tokens
         if amount0 > 0 {
-            token::Client::new(&env, &config.token_a)
+            token::Client::new(&env, &pool.token0)
                 .transfer(&pool_addr, &owner, &amount0);
         }
 
         if amount1 > 0 {
-            token::Client::new(&env, &config.token_b)
+            token::Client::new(&env, &pool.token1)
                 .transfer(&pool_addr, &owner, &amount1);
         }
 
         env.events().publish(
-            (Symbol::new(&env, "rm_liq"),),
-            (liquidity_to_remove, amount0, amount1),
+            (Symbol::new(&env, "remove_liq"),),
+            (liquidity_delta, amount0, amount1),
         );
 
         (amount0, amount1)
@@ -920,23 +715,23 @@ pub fn swap(
     // COLLECT FEES
     // ========================================================
 
-    /// Collect accumulated fees from a position
-    /// 
     pub fn collect(
         env: Env,
         owner: Address,
         lower_tick: i32,
         upper_tick: i32,
-    ) -> (i128, i128) {
+    ) -> (u128, u128) {
         owner.require_auth();
 
-        let config = read_pool_config(&env);
         let pool = read_pool_state(&env);
         let pool_addr = env.current_contract_address();
 
         let lower = snap_tick_to_spacing(lower_tick, pool.tick_spacing);
         let upper = snap_tick_to_spacing(upper_tick, pool.tick_spacing);
 
+        let mut pos = read_position(&env, &owner, lower, upper);
+
+        // Calculate fee_growth_inside with current state
         let (inside_0, inside_1) = get_fee_growth_inside(
             &env,
             lower,
@@ -946,75 +741,47 @@ pub fn swap(
             pool.fee_growth_global_1,
         );
 
-        let mut pos = read_position(&env, &owner, lower, upper);
-        
-        update_position_fees(&env, &mut pos, lower, upper, inside_0, inside_1);
+        // Update position fees (this accumulates any pending fees)
+        // The update_position function already handles underflow protection
+        update_position(&mut pos, inside_0, inside_1);
 
-        // Convert u128 to i128 for token transfer
-        let amount0 = pos.tokens_owed_0 as i128;
-        let amount1 = pos.tokens_owed_1 as i128;
+        // Collect all owed tokens
+        let amount0 = pos.tokens_owed_0;
+        let amount1 = pos.tokens_owed_1;
 
-        // Validate amounts are reasonable (not overflow bugs)
-        if amount0 < 0 || amount1 < 0 {
-            panic!("invalid fee amounts detected");
-        }
+        // SAFETY CHECK: Fees should never exceed pool balance
+        // Get pool token balances
+        let pool_balance_0 = token::Client::new(&env, &pool.token0)
+            .balance(&pool_addr) as u128;
+        let pool_balance_1 = token::Client::new(&env, &pool.token1)
+            .balance(&pool_addr) as u128;
 
-        // Reset fees after collecting
-        pos.tokens_owed_0 = 0;
-        pos.tokens_owed_1 = 0;
+        // Cap fees to available balance
+        let amount0_capped = amount0.min(pool_balance_0);
+        let amount1_capped = amount1.min(pool_balance_1);
+
+        // Update position with actual collected amounts
+        pos.tokens_owed_0 = pos.tokens_owed_0.saturating_sub(amount0_capped);
+        pos.tokens_owed_1 = pos.tokens_owed_1.saturating_sub(amount1_capped);
+
         write_position(&env, &owner, lower, upper, &pos);
 
-        // Transfer fees to owner
-        if amount0 > 0 {
-            token::Client::new(&env, &config.token_a)
-                .transfer(&pool_addr, &owner, &amount0);
+        // Transfer tokens (only if > 0)
+        if amount0_capped > 0 {
+            token::Client::new(&env, &pool.token0)
+                .transfer(&pool_addr, &owner, &(amount0_capped as i128));
         }
 
-        if amount1 > 0 {
-            token::Client::new(&env, &config.token_b)
-                .transfer(&pool_addr, &owner, &amount1);
+        if amount1_capped > 0 {
+            token::Client::new(&env, &pool.token1)
+                .transfer(&pool_addr, &owner, &(amount1_capped as i128));
         }
 
         env.events().publish(
             (Symbol::new(&env, "collect"),),
-            (amount0, amount1),
+            (amount0_capped, amount1_capped),
         );
 
-        (amount0, amount1)
-    }
-
-    // ========================================================
-    // ADMIN FUNCTIONS
-    // ========================================================
-
-    pub fn collect_protocol(env: Env, caller: Address) -> (u128, u128) {
-        caller.require_auth();
-
-        let config = read_pool_config(&env);
-        if caller != config.admin {
-            panic!("unauthorized");
-        }
-
-        let mut pool = read_pool_state(&env);
-        let pool_addr = env.current_contract_address();
-
-        let amount0 = pool.protocol_fees_0;
-        let amount1 = pool.protocol_fees_1;
-
-        pool.protocol_fees_0 = 0;
-        pool.protocol_fees_1 = 0;
-        write_pool_state(&env, &pool);
-
-        if amount0 > 0 {
-            token::Client::new(&env, &config.token_a)
-                .transfer(&pool_addr, &caller, &(amount0 as i128));
-        }
-
-        if amount1 > 0 {
-            token::Client::new(&env, &config.token_b)
-                .transfer(&pool_addr, &caller, &(amount1 as i128));
-        }
-
-        (amount0, amount1)
+        (amount0_capped, amount1_capped)
     }
 }
