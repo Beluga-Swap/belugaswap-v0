@@ -1,68 +1,31 @@
-use soroban_sdk::{Env, contracttype};
-use crate::DataKey;
+use soroban_sdk::Env;
+
+use crate::constants::{MIN_TICK, MAX_TICK, MAX_TICK_SEARCH_STEPS};
+use crate::storage::{read_tick_info, write_tick_info};
 use crate::math::snap_tick_to_spacing;
-
-// ============================================================
-// TICK DATA STRUCTURE (Uniswap V3 Style)
-// ============================================================
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct TickInfo {
-    /// Total liquidity referencing this tick (for garbage collection)
-    pub liquidity_gross: i128,
-    /// Net liquidity change when crossing this tick left-to-right
-    pub liquidity_net: i128,
-    /// Fee growth per unit of liquidity on the OTHER side of this tick (token0)
-    /// Flipped when the tick is crossed
-    pub fee_growth_outside_0: u128,
-    /// Fee growth per unit of liquidity on the OTHER side of this tick (token1)
-    /// Flipped when the tick is crossed
-    pub fee_growth_outside_1: u128,
-    /// True if tick has been initialized
-    pub initialized: bool,
-}
-
-impl Default for TickInfo {
-    fn default() -> Self {
-        TickInfo {
-            liquidity_gross: 0,
-            liquidity_net: 0,
-            fee_growth_outside_0: 0,
-            fee_growth_outside_1: 0,
-            initialized: false,
-        }
-    }
-}
-
-// ============================================================
-// STORAGE HELPERS
-// ============================================================
-
-pub fn read_tick_info(env: &Env, tick: i32) -> TickInfo {
-    env.storage()
-        .persistent()
-        .get::<_, TickInfo>(&DataKey::Tick(tick))
-        .unwrap_or_default()
-}
-
-pub fn write_tick_info(env: &Env, tick: i32, info: &TickInfo) {
-    // Clear tick if no longer referenced by any position
-    if info.liquidity_gross == 0 && !info.initialized {
-        env.storage().persistent().remove(&DataKey::Tick(tick));
-    } else {
-        env.storage()
-            .persistent()
-            .set::<_, TickInfo>(&DataKey::Tick(tick), info);
-    }
-}
 
 // ============================================================
 // TICK UPDATE (Called when modifying liquidity)
 // ============================================================
 
-/// Update a tick and return true if the tick was flipped from uninitialized to initialized (or vice versa)
-/// This follows Uniswap V3's Tick.update() pattern
+/// Update a tick when liquidity is added or removed
+/// 
+/// This follows Uniswap V3's Tick.update() pattern:
+/// - Initializes fee_growth_outside based on current tick position
+/// - Updates liquidity_gross and liquidity_net
+/// - Returns true if tick was flipped (initialized/uninitialized)
+/// 
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `tick` - Tick index to update
+/// * `current_tick` - Current pool tick
+/// * `liquidity_delta` - Liquidity change (positive = add, negative = remove)
+/// * `fee_growth_global_0` - Current global fee growth for token0
+/// * `fee_growth_global_1` - Current global fee growth for token1
+/// * `upper` - True if this is an upper tick boundary
+/// 
+/// # Returns
+/// True if the tick was flipped from uninitialized to initialized (or vice versa)
 pub fn update_tick(
     env: &Env,
     tick: i32,
@@ -70,7 +33,7 @@ pub fn update_tick(
     liquidity_delta: i128,
     fee_growth_global_0: u128,
     fee_growth_global_1: u128,
-    upper: bool, // true if this is an upper tick boundary
+    upper: bool,
 ) -> bool {
     let mut info = read_tick_info(env, tick);
     
@@ -81,13 +44,13 @@ pub fn update_tick(
         liquidity_gross_before.saturating_sub(liquidity_delta.abs())
     };
     
-    // Tick flipped?
+    // Check if tick was flipped
     let flipped = (liquidity_gross_after == 0) != (liquidity_gross_before == 0);
     
     // Initialize tick if crossing from 0 liquidity
     if liquidity_gross_before == 0 && liquidity_gross_after > 0 {
         // Initialize fee_growth_outside based on current tick position
-        // By convention, if current tick >= this tick, we assume all fees were earned BELOW this tick
+        // Convention: if current_tick >= tick, assume all fees were earned BELOW this tick
         if current_tick >= tick {
             info.fee_growth_outside_0 = fee_growth_global_0;
             info.fee_growth_outside_1 = fee_growth_global_1;
@@ -124,8 +87,16 @@ pub fn update_tick(
 // TICK TRAVERSAL
 // ============================================================
 
-/// Find next initialized tick for swap iteration
-/// Returns the next initialized tick in the given direction
+/// Find the next initialized tick in the given direction
+/// 
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `current_tick` - Starting tick
+/// * `tick_spacing` - Pool's tick spacing
+/// * `zero_for_one` - Direction (true = search left, false = search right)
+/// 
+/// # Returns
+/// The next initialized tick, or current_tick if none found
 pub fn find_next_initialized_tick(
     env: &Env,
     current_tick: i32,
@@ -136,11 +107,7 @@ pub fn find_next_initialized_tick(
         return current_tick;
     }
 
-    let step = if zero_for_one {
-        -tick_spacing
-    } else {
-        tick_spacing
-    };
+    let step = if zero_for_one { -tick_spacing } else { tick_spacing };
 
     // Start from aligned tick
     let mut tick = snap_tick_to_spacing(current_tick, tick_spacing);
@@ -148,10 +115,9 @@ pub fn find_next_initialized_tick(
     // Move to next tick boundary
     tick = tick.saturating_add(step);
 
-    let max_steps: i32 = 2000;
-    for _ in 0..max_steps {
+    for _ in 0..MAX_TICK_SEARCH_STEPS {
         // Check bounds
-        if !(crate::math::MIN_TICK..=crate::math::MAX_TICK).contains(&tick) {
+        if !(MIN_TICK..=MAX_TICK).contains(&tick) {
             return current_tick;
         }
 
@@ -169,18 +135,24 @@ pub fn find_next_initialized_tick(
 }
 
 // ============================================================
-// TICK CROSSING (Uniswap V3 Style - Simplified)
+// TICK CROSSING (Uniswap V3 Style)
 // ============================================================
 
 /// Cross a tick boundary during a swap
-/// This is the core function that handles tick crossing
 /// 
-/// Key insight from Uniswap V3:
+/// This is the core Uniswap V3 fee tracking mechanism:
 /// - fee_growth_outside represents fees accumulated on the "other side" of the tick
 /// - When crossing, we flip it: new_outside = global - old_outside
 /// - This automatically updates which side is "inside" vs "outside" for all positions
 /// 
-/// Returns the liquidity_net to add/subtract from active liquidity
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `tick` - Tick being crossed
+/// * `fee_growth_global_0` - Current global fee growth for token0
+/// * `fee_growth_global_1` - Current global fee growth for token1
+/// 
+/// # Returns
+/// The liquidity_net to add/subtract from active liquidity
 pub fn cross_tick(
     env: &Env,
     tick: i32,
@@ -201,12 +173,13 @@ pub fn cross_tick(
 }
 
 // ============================================================
-// FEE GROWTH INSIDE CALCULATION (Uniswap V3 Style)
+// FEE GROWTH INSIDE CALCULATION
 // ============================================================
 
 /// Calculate fee growth inside a tick range
 /// 
-/// Formula: fee_growth_inside = global - below - above
+/// This is the key formula for calculating fees earned by a position:
+/// fee_growth_inside = global - below - above
 /// 
 /// Where:
 /// - "below" is fees accumulated below lower_tick
@@ -215,6 +188,17 @@ pub fn cross_tick(
 /// The magic: fee_growth_outside at each tick is defined relative to current_tick
 /// - If current_tick >= tick: outside = fees below tick
 /// - If current_tick < tick: outside = fees above tick
+/// 
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `lower_tick` - Position's lower tick
+/// * `upper_tick` - Position's upper tick
+/// * `current_tick` - Pool's current tick
+/// * `fee_growth_global_0` - Global fee growth for token0
+/// * `fee_growth_global_1` - Global fee growth for token1
+/// 
+/// # Returns
+/// (fee_growth_inside_0, fee_growth_inside_1)
 pub fn get_fee_growth_inside(
     env: &Env,
     lower_tick: i32,
@@ -269,31 +253,19 @@ pub fn get_fee_growth_inside(
 }
 
 // ============================================================
-// LEGACY HELPER (for backwards compatibility)
+// TICK VALIDATION
 // ============================================================
 
-/// Initialize tick if needed - simplified version
-/// Prefer using update_tick() for new code
-pub fn initialize_tick_if_needed(
-    env: &Env,
-    tick: i32,
-    current_tick: i32,
-    fee_growth_global_0: u128,
-    fee_growth_global_1: u128,
-) -> TickInfo {
-    let mut info = read_tick_info(env, tick);
+/// Check if a tick is within valid range
+#[inline]
+pub fn is_valid_tick(tick: i32) -> bool {
+    tick >= MIN_TICK && tick <= MAX_TICK
+}
 
-    // Only initialize if not yet done
-    if !info.initialized && info.liquidity_gross == 0 {
-        if current_tick >= tick {
-            info.fee_growth_outside_0 = fee_growth_global_0;
-            info.fee_growth_outside_1 = fee_growth_global_1;
-        } else {
-            info.fee_growth_outside_0 = 0;
-            info.fee_growth_outside_1 = 0;
-        }
-        info.initialized = true;
-    }
-
-    info
+/// Check if a tick is properly aligned to spacing
+#[inline]
+#[allow(dead_code)]
+pub fn is_aligned_tick(tick: i32, tick_spacing: i32) -> bool {
+    if tick_spacing <= 0 { return false; }
+    tick % tick_spacing == 0
 }

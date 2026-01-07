@@ -1,79 +1,24 @@
-use soroban_sdk::{Env, contracttype, Address};
-use crate::DataKey;
+use soroban_sdk::{Address, Env};
+
+use crate::storage::{read_position as storage_read, write_position as storage_write};
+use crate::types::Position;
 
 // ============================================================
-// POSITION DATA STRUCTURE (Uniswap V3 Style)
+// POSITION STORAGE HELPERS
 // ============================================================
 
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Position {
-    /// The amount of liquidity owned by this position
-    pub liquidity: i128,
-
-    /// Fee growth inside the position's tick range as of the last update (token0)
-    /// This is used to calculate owed fees
-    pub fee_growth_inside_last_0: u128,
-
-    /// Fee growth inside the position's tick range as of the last update (token1)
-    pub fee_growth_inside_last_1: u128,
-
-    /// Uncollected token0 owed to the position
-    pub tokens_owed_0: u128,
-
-    /// Uncollected token1 owed to the position
-    pub tokens_owed_1: u128,
-}
-
-impl Default for Position {
-    fn default() -> Self {
-        Position {
-            liquidity: 0,
-            fee_growth_inside_last_0: 0,
-            fee_growth_inside_last_1: 0,
-            tokens_owed_0: 0,
-            tokens_owed_1: 0,
-        }
-    }
-}
-
-// ============================================================
-// STORAGE HELPERS
-// ============================================================
-
-/// Read position from storage, returns default if not found
+/// Read a position from storage
 pub fn read_position(env: &Env, owner: &Address, lower: i32, upper: i32) -> Position {
-    env.storage()
-        .persistent()
-        .get::<_, Position>(&DataKey::Position(owner.clone(), lower, upper))
-        .unwrap_or_default()
+    storage_read(env, owner, lower, upper)
 }
 
-/// Write position to storage, removes if empty
-pub fn write_position(
-    env: &Env,
-    owner: &Address,
-    lower: i32,
-    upper: i32,
-    pos: &Position,
-) {
-    // Only delete if completely empty (no liquidity and no pending fees)
-    if pos.liquidity == 0 && pos.tokens_owed_0 == 0 && pos.tokens_owed_1 == 0 {
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Position(owner.clone(), lower, upper));
-    } else {
-        env.storage()
-            .persistent()
-            .set::<_, Position>(
-                &DataKey::Position(owner.clone(), lower, upper),
-                pos,
-            );
-    }
+/// Write a position to storage
+pub fn write_position(env: &Env, owner: &Address, lower: i32, upper: i32, pos: &Position) {
+    storage_write(env, owner, lower, upper, pos);
 }
 
 // ============================================================
-// POSITION UPDATE (Uniswap V3 Style)
+// POSITION UPDATE (Fee Accumulation)
 // ============================================================
 
 /// Update a position's fee checkpoints and calculate owed tokens
@@ -85,6 +30,11 @@ pub fn write_position(
 /// 
 /// In Uniswap V3, wrapping arithmetic is used and it always works correctly
 /// because fee_growth_inside is consistent through tick crossings.
+/// 
+/// # Arguments
+/// * `pos` - Mutable reference to position
+/// * `fee_growth_inside_0` - Current fee growth inside for token0
+/// * `fee_growth_inside_1` - Current fee growth inside for token1
 pub fn update_position(
     pos: &mut Position,
     fee_growth_inside_0: u128,
@@ -94,14 +44,11 @@ pub fn update_position(
         let liquidity_u = pos.liquidity as u128;
         
         // Calculate fee deltas using wrapping subtraction
-        // In Uniswap V3, this always works because fee_growth_inside
-        // is consistent - it never "decreases" for an active position
         let delta_0 = fee_growth_inside_0.wrapping_sub(pos.fee_growth_inside_last_0);
         let delta_1 = fee_growth_inside_1.wrapping_sub(pos.fee_growth_inside_last_1);
         
-        // Calculate owed fees using safe multiplication
+        // Calculate owed fees using checked multiplication to detect overflow
         // fee = (liquidity * delta) >> 64
-        // Use checked multiplication to detect overflow
         let fee_0 = match liquidity_u.checked_mul(delta_0) {
             Some(product) => product >> 64,
             None => {
@@ -126,33 +73,60 @@ pub fn update_position(
     pos.fee_growth_inside_last_1 = fee_growth_inside_1;
 }
 
-/// Modify position liquidity and update fees
-/// This combines fee update with liquidity modification
+// ============================================================
+// POSITION MODIFICATION
+// ============================================================
+
+/// Modify a position's liquidity
+/// 
+/// This combines fee update with liquidity change:
+/// 1. First update fees based on current fee_growth_inside
+/// 2. Then adjust liquidity
+/// 
+/// # Arguments
+/// * `pos` - Mutable reference to position
+/// * `liquidity_delta` - Change in liquidity (positive = add, negative = remove)
+/// * `fee_growth_inside_0` - Current fee growth inside for token0
+/// * `fee_growth_inside_1` - Current fee growth inside for token1
 pub fn modify_position(
     pos: &mut Position,
     liquidity_delta: i128,
     fee_growth_inside_0: u128,
     fee_growth_inside_1: u128,
 ) {
-    // First update fees based on current liquidity
+    // First update fees
     update_position(pos, fee_growth_inside_0, fee_growth_inside_1);
     
-    // Then modify liquidity
+    // Then adjust liquidity
     if liquidity_delta > 0 {
         pos.liquidity = pos.liquidity.saturating_add(liquidity_delta);
-    } else if liquidity_delta < 0 {
+    } else {
         pos.liquidity = pos.liquidity.saturating_sub(liquidity_delta.abs());
     }
 }
 
+// ============================================================
+// PENDING FEE CALCULATION
+// ============================================================
+
 /// Calculate pending fees without modifying position
-/// Used for view functions
+/// 
+/// This is a read-only calculation for display purposes.
+/// Uses the same formula as update_position but doesn't modify state.
+/// 
+/// # Arguments
+/// * `pos` - Reference to position
+/// * `fee_growth_inside_0` - Current fee growth inside for token0
+/// * `fee_growth_inside_1` - Current fee growth inside for token1
+/// 
+/// # Returns
+/// (pending_fee_0, pending_fee_1)
 pub fn calculate_pending_fees(
     pos: &Position,
     fee_growth_inside_0: u128,
     fee_growth_inside_1: u128,
 ) -> (u128, u128) {
-    if pos.liquidity == 0 {
+    if pos.liquidity <= 0 {
         return (0, 0);
     }
     
@@ -162,32 +136,47 @@ pub fn calculate_pending_fees(
     let delta_0 = fee_growth_inside_0.wrapping_sub(pos.fee_growth_inside_last_0);
     let delta_1 = fee_growth_inside_1.wrapping_sub(pos.fee_growth_inside_last_1);
     
-    // Sanity check: if delta > half of u128::MAX, it's likely underflow
-    // This can happen during view calls when position is in unusual state
-    const MAX_REASONABLE_DELTA: u128 = u128::MAX / 2;
-    
-    let pending_0 = if delta_0 < MAX_REASONABLE_DELTA {
-        (liquidity_u.wrapping_mul(delta_0)) >> 64
-    } else {
-        0
+    // Calculate pending fees with overflow protection
+    let pending_0 = match liquidity_u.checked_mul(delta_0) {
+        Some(product) => product >> 64,
+        None => 0,
     };
     
-    let pending_1 = if delta_1 < MAX_REASONABLE_DELTA {
-        (liquidity_u.wrapping_mul(delta_1)) >> 64
-    } else {
-        0
+    let pending_1 = match liquidity_u.checked_mul(delta_1) {
+        Some(product) => product >> 64,
+        None => 0,
     };
     
     (pending_0, pending_1)
 }
 
-/// Collect owed tokens and reset counters
-pub fn collect_fees(pos: &mut Position, amount0_max: u128, amount1_max: u128) -> (u128, u128) {
-    let amount0 = pos.tokens_owed_0.min(amount0_max);
-    let amount1 = pos.tokens_owed_1.min(amount1_max);
-    
+// ============================================================
+// POSITION HELPERS
+// ============================================================
+
+/// Check if a position has any liquidity
+#[inline]
+pub fn has_liquidity(pos: &Position) -> bool {
+    pos.liquidity > 0
+}
+
+/// Check if a position has uncollected fees
+#[inline]
+#[allow(dead_code)]
+pub fn has_uncollected_fees(pos: &Position) -> bool {
+    pos.tokens_owed_0 > 0 || pos.tokens_owed_1 > 0
+}
+
+/// Check if a position is empty (no liquidity and no fees)
+#[inline]
+#[allow(dead_code)]
+pub fn is_empty(pos: &Position) -> bool {
+    pos.liquidity == 0 && pos.tokens_owed_0 == 0 && pos.tokens_owed_1 == 0
+}
+
+/// Clear collected fees from position
+#[allow(dead_code)]
+pub fn clear_fees(pos: &mut Position, amount0: u128, amount1: u128) {
     pos.tokens_owed_0 = pos.tokens_owed_0.saturating_sub(amount0);
     pos.tokens_owed_1 = pos.tokens_owed_1.saturating_sub(amount1);
-    
-    (amount0, amount1)
 }

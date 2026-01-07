@@ -303,5 +303,3 @@ limitations under the License.
 ```
 
 ---
-
-**Built with ❤️ from BelugaSwap**

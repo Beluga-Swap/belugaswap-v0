@@ -1,55 +1,35 @@
-use soroban_sdk::{Env, symbol_short};
+use soroban_sdk::{Env, Symbol};
 
-use crate::pool::PoolState;
+use crate::constants::{
+    MIN_SWAP_AMOUNT, MIN_OUTPUT_AMOUNT, MAX_SLIPPAGE_BPS, MAX_SWAP_ITERATIONS,
+};
+use crate::error::ErrorSymbol;
+use crate::events::emit_sync_tick;
 use crate::math::{compute_swap_step_with_target, get_sqrt_ratio_at_tick, div_q64};
+use crate::storage::read_tick_info;
 use crate::tick::{find_next_initialized_tick, cross_tick};
+use crate::types::PoolState;
 
 // ============================================================
-// CONSTANTS
+// PUBLIC SWAP FUNCTIONS
 // ============================================================
 
-pub const MIN_SWAP_AMOUNT: i128 = 1;
-pub const MIN_OUTPUT_AMOUNT: i128 = 1;
-pub const MAX_SLIPPAGE_BPS: i128 = 5000;
-
-// ============================================================
-// SWAP ENGINE (Uniswap V3 Style)
-// ============================================================
-
-/// Internal swap implementation - safe version (returns (0,0) on error)
-/// When dry_run is true, tick state is not modified (for quotes)
-fn engine_swap_safe(
-    env: &Env,
-    pool: &mut PoolState,
-    amount_specified: i128,
-    zero_for_one: bool,
-    sqrt_price_limit_x64: u128,
-    fee_bps: i128,
-    protocol_fee_bps: i128,
-) -> (i128, i128) {
-    if amount_specified < MIN_SWAP_AMOUNT || amount_specified <= 0 {
-        return (0, 0);
-    }
-
-    if pool.liquidity <= 0 {
-        return (0, 0);
-    }
-
-    // For safe/quote version, we use dry_run = true to avoid modifying tick state
-    engine_swap_internal(
-        env,
-        pool,
-        amount_specified,
-        zero_for_one,
-        sqrt_price_limit_x64,
-        fee_bps,
-        protocol_fee_bps,
-        false, // allow_panic
-        true,  // dry_run - DON'T modify tick state!
-    )
-}
-
-/// Main swap entry point - panics on error
+/// Execute a swap (modifies state)
+/// 
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `pool` - Mutable pool state
+/// * `amount_specified` - Input amount
+/// * `zero_for_one` - Direction (true = token0 -> token1)
+/// * `sqrt_price_limit_x64` - Price limit (0 for no limit)
+/// * `fee_bps` - Fee in basis points
+/// * `protocol_fee_bps` - Protocol fee in basis points
+/// 
+/// # Returns
+/// (amount_in, amount_out)
+/// 
+/// # Panics
+/// If swap amount is too small or no liquidity available
 pub fn engine_swap(
     env: &Env,
     pool: &mut PoolState,
@@ -60,7 +40,7 @@ pub fn engine_swap(
     protocol_fee_bps: i128,
 ) -> (i128, i128) {
     if amount_specified < MIN_SWAP_AMOUNT {
-        panic!("swap amount too small, minimum is {}", MIN_SWAP_AMOUNT);
+        panic!("swap amount too small");
     }
 
     if amount_specified <= 0 {
@@ -79,13 +59,145 @@ pub fn engine_swap(
         sqrt_price_limit_x64,
         fee_bps,
         protocol_fee_bps,
-        true,  // allow_panic
-        false, // dry_run = false, actually modify state
+        true,   // allow_panic
+        false,  // dry_run = false, actually modify state
+    )
+}
+
+/// Quote a swap without executing it
+/// 
+/// # Returns
+/// (amount_in_used, amount_out, final_sqrt_price)
+pub fn quote_swap(
+    env: &Env,
+    pool: &PoolState,
+    amount_in: i128,
+    zero_for_one: bool,
+    sqrt_price_limit_x64: u128,
+    fee_bps: i128,
+) -> (i128, i128, u128) {
+    if amount_in < MIN_SWAP_AMOUNT || amount_in <= 0 || pool.liquidity <= 0 {
+        return (0, 0, pool.sqrt_price_x64);
+    }
+
+    // Clone pool for simulation
+    let mut sim_pool = pool.clone();
+
+    let (amount_in_used, amount_out) = engine_swap_safe(
+        env,
+        &mut sim_pool,
+        amount_in,
+        zero_for_one,
+        sqrt_price_limit_x64,
+        fee_bps,
+        0, // No protocol fee for quotes
+    );
+
+    (amount_in_used, amount_out, sim_pool.sqrt_price_x64)
+}
+
+/// Validate and preview a swap
+/// 
+/// # Returns
+/// Ok((amount_in_used, amount_out, fee_paid, final_price)) or Err(Symbol)
+pub fn validate_and_preview_swap(
+    env: &Env,
+    pool: &PoolState,
+    amount_in: i128,
+    min_amount_out: i128,
+    zero_for_one: bool,
+    sqrt_price_limit_x64: u128,
+    fee_bps: i128,
+) -> Result<(i128, i128, i128, u128), Symbol> {
+    // Validate input amount
+    if amount_in < MIN_SWAP_AMOUNT {
+        return Err(ErrorSymbol::amt_low());
+    }
+
+    // Validate liquidity
+    if pool.liquidity <= 0 {
+        return Err(ErrorSymbol::no_liq());
+    }
+
+    // Get quote
+    let (amount_in_used, amount_out, final_price) = quote_swap(
+        env,
+        pool,
+        amount_in,
+        zero_for_one,
+        sqrt_price_limit_x64,
+        fee_bps,
+    );
+
+    // Check slippage
+    if amount_out < min_amount_out {
+        return Err(ErrorSymbol::slip_hi());
+    }
+
+    // Check minimum output
+    if amount_out < MIN_OUTPUT_AMOUNT {
+        return Err(ErrorSymbol::out_dust());
+    }
+
+    // Calculate fee paid
+    let fee_paid = amount_in_used.saturating_sub(amount_out);
+
+    // Calculate slippage in basis points
+    let slippage_bps = if amount_in_used > 0 {
+        (amount_in.saturating_sub(amount_out))
+            .saturating_mul(10000)
+            .saturating_div(amount_in)
+    } else {
+        0
+    };
+
+    // Check maximum slippage
+    if slippage_bps > MAX_SLIPPAGE_BPS {
+        return Err(ErrorSymbol::slip_max());
+    }
+
+    Ok((amount_in_used, amount_out, fee_paid, final_price))
+}
+
+// ============================================================
+// INTERNAL SWAP FUNCTIONS
+// ============================================================
+
+/// Safe swap version (returns (0,0) on error instead of panicking)
+fn engine_swap_safe(
+    env: &Env,
+    pool: &mut PoolState,
+    amount_specified: i128,
+    zero_for_one: bool,
+    sqrt_price_limit_x64: u128,
+    fee_bps: i128,
+    protocol_fee_bps: i128,
+) -> (i128, i128) {
+    if amount_specified < MIN_SWAP_AMOUNT || amount_specified <= 0 {
+        return (0, 0);
+    }
+
+    if pool.liquidity <= 0 {
+        return (0, 0);
+    }
+
+    engine_swap_internal(
+        env,
+        pool,
+        amount_specified,
+        zero_for_one,
+        sqrt_price_limit_x64,
+        fee_bps,
+        protocol_fee_bps,
+        false, // allow_panic
+        true,  // dry_run - DON'T modify tick state!
     )
 }
 
 /// Core swap logic following Uniswap V3 pattern
-/// When dry_run is true, tick storage is NOT modified (used for quotes/simulations)
+/// 
+/// # Arguments
+/// * `dry_run` - If true, tick storage is NOT modified (for quotes)
 fn engine_swap_internal(
     env: &Env,
     pool: &mut PoolState,
@@ -95,8 +207,9 @@ fn engine_swap_internal(
     fee_bps: i128,
     protocol_fee_bps: i128,
     allow_panic: bool,
-    dry_run: bool, // NEW: if true, don't modify tick state
+    dry_run: bool,
 ) -> (i128, i128) {
+    // Initialize swap state
     let mut amount_remaining = amount_specified;
     let mut amount_out_total: i128 = 0;
     let mut total_protocol_fee: i128 = 0;
@@ -116,10 +229,10 @@ fn engine_swap_internal(
         sqrt_price_limit_x64
     };
 
+    // Main swap loop
     let mut iterations = 0;
-    const MAX_ITERATIONS: u32 = 1024;
 
-    while iterations < MAX_ITERATIONS {
+    while iterations < MAX_SWAP_ITERATIONS {
         iterations += 1;
 
         // Exit conditions
@@ -198,19 +311,7 @@ fn engine_swap_internal(
         }
 
         // Calculate step fee
-        let step_fee = if amount_in == amount_available {
-            // Used all available amount
-            amount_remaining.saturating_sub(amount_in)
-        } else {
-            // Calculate fee on amount_in
-            let fee_num = amount_in.saturating_mul(fee_bps);
-            let fee = fee_num.saturating_div(fee_divisor);
-            if fee_num % fee_divisor != 0 {
-                fee.saturating_add(1) // Round up
-            } else {
-                fee
-            }
-        };
+        let step_fee = calculate_step_fee(amount_in, amount_remaining, amount_available, fee_bps, fee_divisor);
 
         // Validate fee
         if step_fee < 0 || step_fee > amount_in {
@@ -241,7 +342,6 @@ fn engine_swap_internal(
         if liquidity > 0 && lp_fee > 0 {
             let fee_u = lp_fee as u128;
             let liq_u = liquidity as u128;
-            // Fee growth in Q64.64 format
             let growth_delta = div_q64(fee_u, liq_u);
 
             if zero_for_one {
@@ -267,7 +367,7 @@ fn engine_swap_internal(
             // Cross tick - but only modify storage if NOT dry_run
             let liquidity_net = if dry_run {
                 // For dry run (quotes), just read the liquidity_net without modifying storage
-                let tick_info = crate::tick::read_tick_info(env, next_tick);
+                let tick_info = read_tick_info(env, next_tick);
                 tick_info.liquidity_net
             } else {
                 // Actually cross the tick and modify storage
@@ -282,11 +382,9 @@ fn engine_swap_internal(
             // Update liquidity based on direction
             if zero_for_one {
                 // Moving left (price decreasing)
-                // When crossing from right to left, subtract liquidity_net
                 liquidity = liquidity.saturating_sub(liquidity_net);
             } else {
                 // Moving right (price increasing)
-                // When crossing from left to right, add liquidity_net
                 liquidity = liquidity.saturating_add(liquidity_net);
             }
 
@@ -312,10 +410,7 @@ fn engine_swap_internal(
     // Validate output
     if amount_out_total < MIN_OUTPUT_AMOUNT {
         if allow_panic {
-            panic!(
-                "output amount too small, got {}, minimum is {}",
-                amount_out_total, MIN_OUTPUT_AMOUNT
-            );
+            panic!("output amount too small");
         } else {
             return (0, 0);
         }
@@ -329,121 +424,43 @@ fn engine_swap_internal(
     // Accumulate protocol fees
     if total_protocol_fee > 0 {
         if zero_for_one {
-            pool.protocol_fees_0 = pool
-                .protocol_fees_0
-                .saturating_add(total_protocol_fee as u128);
+            pool.protocol_fees_0 = pool.protocol_fees_0.saturating_add(total_protocol_fee as u128);
         } else {
-            pool.protocol_fees_1 = pool
-                .protocol_fees_1
-                .saturating_add(total_protocol_fee as u128);
+            pool.protocol_fees_1 = pool.protocol_fees_1.saturating_add(total_protocol_fee as u128);
         }
     }
 
     // Emit sync event
-    env.events().publish(
-        (symbol_short!("synctk"),),
-        (pool.current_tick, pool.sqrt_price_x64),
-    );
+    emit_sync_tick(env, pool.current_tick, pool.sqrt_price_x64);
 
     let amount_in_total = amount_specified.saturating_sub(amount_remaining);
     (amount_in_total, amount_out_total)
 }
 
 // ============================================================
-// SWAP QUOTE (DRY RUN)
+// HELPER FUNCTIONS
 // ============================================================
 
-/// Quote a swap without executing it
-pub fn quote_swap(
-    env: &Env,
-    pool: &PoolState,
+/// Calculate the fee for a swap step
+#[inline]
+fn calculate_step_fee(
     amount_in: i128,
-    zero_for_one: bool,
-    sqrt_price_limit_x64: u128,
+    amount_remaining: i128,
+    amount_available: i128,
     fee_bps: i128,
-) -> (i128, i128, u128) {
-    if amount_in < MIN_SWAP_AMOUNT || amount_in <= 0 || pool.liquidity <= 0 {
-        return (0, 0, pool.sqrt_price_x64);
-    }
-
-    // Clone pool for simulation
-    let mut sim_pool = pool.clone();
-
-    let (amount_in_used, amount_out) = engine_swap_safe(
-        env,
-        &mut sim_pool,
-        amount_in,
-        zero_for_one,
-        sqrt_price_limit_x64,
-        fee_bps,
-        0, // No protocol fee for quotes
-    );
-
-    (amount_in_used, amount_out, sim_pool.sqrt_price_x64)
-}
-
-// ============================================================
-// SWAP VALIDATION & PREVIEW
-// ============================================================
-
-use soroban_sdk::Symbol;
-
-/// Validate and preview a swap before execution
-pub fn validate_and_preview_swap(
-    env: &Env,
-    pool: &PoolState,
-    amount_in: i128,
-    min_amount_out: i128,
-    zero_for_one: bool,
-    sqrt_price_limit_x64: u128,
-    fee_bps: i128,
-) -> Result<(i128, i128, i128, u128), Symbol> {
-    // Validate input amount
-    if amount_in < MIN_SWAP_AMOUNT {
-        return Err(symbol_short!("AMT_LOW"));
-    }
-
-    // Validate liquidity
-    if pool.liquidity <= 0 {
-        return Err(symbol_short!("NO_LIQ"));
-    }
-
-    // Get quote
-    let (amount_in_used, amount_out, final_price) = quote_swap(
-        env,
-        pool,
-        amount_in,
-        zero_for_one,
-        sqrt_price_limit_x64,
-        fee_bps,
-    );
-
-    // Check slippage
-    if amount_out < min_amount_out {
-        return Err(symbol_short!("SLIP_HI"));
-    }
-
-    // Check minimum output
-    if amount_out < MIN_OUTPUT_AMOUNT {
-        return Err(symbol_short!("OUT_DUST"));
-    }
-
-    // Calculate fee paid
-    let fee_paid = amount_in_used.saturating_sub(amount_out);
-
-    // Calculate slippage in basis points
-    let slippage_bps = if amount_in_used > 0 {
-        (amount_in.saturating_sub(amount_out))
-            .saturating_mul(10000)
-            .saturating_div(amount_in)
+    fee_divisor: i128,
+) -> i128 {
+    if amount_in == amount_available {
+        // Used all available amount
+        amount_remaining.saturating_sub(amount_in)
     } else {
-        0
-    };
-
-    // Check maximum slippage
-    if slippage_bps > MAX_SLIPPAGE_BPS {
-        return Err(symbol_short!("SLIP_MAX"));
+        // Calculate fee on amount_in
+        let fee_num = amount_in.saturating_mul(fee_bps);
+        let fee = fee_num.saturating_div(fee_divisor);
+        if fee_num % fee_divisor != 0 {
+            fee.saturating_add(1) // Round up
+        } else {
+            fee
+        }
     }
-
-    Ok((amount_in_used, amount_out, fee_paid, final_price))
 }
